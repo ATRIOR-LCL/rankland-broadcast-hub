@@ -90,6 +90,31 @@ auth 字段：
 }
 ```
 
+视频轨道为多路编码（simulcast）时，`spatialLayer` 从 0 开始按分辨率从低到高编号（推流端按低清、标清、原画的顺序推送）。不指定 `preferredLayers` 时默认最高层。首选层只是上限，下行带宽不足时服务端仍会自动降层，带宽恢复后再升回。
+
+### 主动事件：setConsumerPreferredLayers - 切换清晰度
+
+前提条件：已通过 `consume` 创建 consumer。
+
+修改 consumer 的首选层级。超出推流端实际层数的 `spatialLayer` 会被压到最高层。
+
+请求参数：
+
+```tsx
+{
+  consumerId: string;
+  preferredLayers: ConsumerLayers;
+}
+```
+
+响应数据：
+
+```tsx
+{
+  preferredLayers?: ConsumerLayers;
+}
+```
+
 ### 主动事件：stopBroadcast - 停止推流
 
 向服务端告知，不再需要推流。这将使服务端向推流用户发送消息，指使它停止所选轨道的推流。可以重复多次发送此事件，以停止其他轨道推流。

@@ -9,6 +9,7 @@ import { ErrCode } from '@common/enums/err-code.enum';
 import MediasoupWorker from '@server/lib/mediasoup-worker';
 import type {
   AppData,
+  Consumer,
   ConsumerLayers,
   DtlsParameters,
   MediaKind,
@@ -39,6 +40,12 @@ interface MediaRoomPeer {
    * 仅 broadcaster/shot 存在此属性
    */
   trackProducers?: Map</** trackId */ string, Producer>;
+  /**
+   * 此 peer 拉流的所有 consumer 实例
+   *
+   * 仅 director 存在此属性
+   */
+  consumers?: Map</** consumerId */ string, Consumer>;
 }
 
 @Provide()
@@ -449,6 +456,15 @@ export default class SocketIOServer {
             },
           });
           console.log(`[socket] [/broadcaster] [consume] [${uca}:${userId}:${id}] consumed track:`, consumer.id);
+          peer.consumers = peer.consumers || new Map();
+          peer.consumers.set(consumer.id, consumer);
+          consumer.observer.once('close', () => peer.consumers?.delete(consumer.id));
+          consumer.on('layerschange', (layers) => {
+            console.log(
+              `[socket] [/broadcaster] [layerschange] [${uca}:${userId}:${id}] consumer ${consumer.id}:`,
+              layers ? `spatial ${layers.spatialLayer}, temporal ${layers.temporalLayer}` : 'none',
+            );
+          });
 
           return {
             consumerId: consumer.id,
@@ -458,6 +474,31 @@ export default class SocketIOServer {
             type: consumer.type,
             producerPaused: consumer.producerPaused,
             appData: consumer.appData,
+          };
+        },
+      );
+
+      /**
+       * setConsumerPreferredLayers: 设置拉流的首选层级（切换清晰度）
+       * @role director
+       */
+      registerSocketEvent(
+        socket,
+        'setConsumerPreferredLayers',
+        async (data: { consumerId: string; preferredLayers: ConsumerLayers }) => {
+          if (role !== 'director') {
+            throw new LogicException(ErrCode.IllegalRequest);
+          }
+
+          console.log(`[socket] [/broadcaster] [setConsumerPreferredLayers] [${uca}:${userId}:${id}] data:`, data);
+          const mediaRoom = this.broadcasterMediaRooms.get(this.getBroadcasterMediaRoomKey(uca, userId));
+          const consumer = mediaRoom?.peers.get(id)?.consumers?.get(data.consumerId);
+          if (!consumer) {
+            throw new LogicException(ErrCode.BroadcastMediaRoomPeerMissing);
+          }
+          await consumer.setPreferredLayers(data.preferredLayers);
+          return {
+            preferredLayers: consumer.preferredLayers,
           };
         },
       );
