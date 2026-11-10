@@ -13,6 +13,19 @@ type Resp<T> =
 - `X-UCA`：比赛 alias。
 - `X-Token`：Hub 管理/导播鉴权 token。
 
+## 首版实现说明（2026-11-02）
+
+本版只实现手动回放：自动化配置、run、agent 接口和 automation 来源均不实现，相关章节仅作未来参考。
+实现与本文的补充和差异见 [契约补充](../../../specs/001-highlight-replay/contracts/highlight-replay.md)，要点：
+
+- 导播鉴权沿用现有 `X-Token` / `directorToken`，比赛由 `X-UCA` 指定（列表接口的 `uca` 也从请求头读取）。
+- KtB 使用 `X-Upload-Token`；进度上报必须带 `itemId`、`generation`，只能报告 `client_processing`、
+  `uploading`、`failed`，`verifying` / `ready` 由 Hub 判定。
+- `requestCreateClip.items` 增加 `generation`；新一轮使旧 token 失效，客户端按任务项和代次去重。
+- 同代同角色同声明的上传创建返回已有会话及当前 offset，声明不同报错。
+- complete 接受后先返回 `verifying` 的任务，校验结果通过 `clipTaskUpdated` / `clipCreated` 推送或查询获得。
+- 原生接口的错误状态码、Range 规则和新增业务码见契约补充。
+
 ## 枚举
 
 ```ts
@@ -199,7 +212,7 @@ interface Clip {
 }
 ```
 
-## 自动化任务管理 API
+## 自动化任务管理 API（后续版本，本版不实现）
 
 ### POST /api/clips/automations
 
@@ -328,11 +341,11 @@ interface ListClipAutomationRunsResp {
 }
 ```
 
-## 自动化 agent 边界 API
+## 自动化 agent 边界 API（后续版本，本版不实现）
 
 以下接口只面向未来归属于 Hub 服务端的自动化 agent 或子脚本，不面向 KtO，也不代表 Hub 首版需要实现 trigger 检查逻辑。agent 可以用这些接口记录命中结果，并复用 `POST /api/clips/tasks` 创建具体切片任务。
 
-建议使用独立的 `X-Agent-Token` 或本机 IPC 鉴权；如果首版只实现 HTTP，可临时复用 `X-Token`，但文档语义上仍视为内部接口。
+后续自动化阶段需独立比赛范围鉴权；本版不提供 `X-Agent-Token` 或对应接口。
 
 ### POST /api/clips/automations/:automationId/runs
 
@@ -389,7 +402,7 @@ interface UpdateClipAutomationRunResp {
 
 ### POST /api/clips/tasks
 
-创建具体切片任务。该接口供导播手动触发，也供未来 Hub 自动化 agent 命中条件后调用。
+本版仅供导播手动创建具体切片任务；未来自动化复用将在后续版本设计和实现。
 
 请求：
 
@@ -415,7 +428,7 @@ interface CreateClipTaskReq {
 
 - `endServerMs` 必须大于 `startServerMs`。
 - `trackIds` 至少包含一个 track。
-- `source = 'automation'` 时，建议携带 `automationId` 和 `automationRunId`。
+- 本版 `source` 仅接受 `'manual'`，拒绝 `automationId`、`automationRunId`；下文历史类型中的自动化字段仅为未来参考。
 - `idempotencyKey` 在同一 `uca` 内幂等；重复请求返回已创建任务。
 
 响应：
@@ -475,8 +488,9 @@ KtB 报告任务或任务项进度。
 
 ```ts
 interface ReportClipTaskProgressReq {
-  itemId?: string;
-  status?: ClipTaskStatus | ClipTaskItemStatus;
+  itemId: string;
+  generation: number;
+  status?: 'client_processing' | 'uploading' | 'failed';
   progress: number;
   message?: string;
   errorCode?: string;
@@ -494,7 +508,8 @@ interface ReportClipTaskProgressResp {
 
 ## 上传 API
 
-上传 API 使用短期 upload token。token 由 Hub 在 `requestCreateClip` 事件中下发，或由创建上传会话接口返回。token 必须和 `taskId`、`itemId`、`uploadId`、`uca` 绑定。
+上传 API 使用 `requestCreateClip` 下发的短期任务项 token，先绑定 `taskId`、`itemId`、
+`uca` 和 `generation`；创建上传后通过会话记录验证 `uploadId` 及角色归属。
 
 ### POST /api/clips/tasks/:taskId/uploads
 
@@ -510,6 +525,7 @@ interface ReportClipTaskProgressResp {
 ```ts
 interface CreateClipUploadReq {
   itemId: string;
+  generation: number;
   trackId: string;
   role: 'media' | 'thumbnail';
   fileName: string;
@@ -525,7 +541,7 @@ interface CreateClipUploadReq {
 interface CreateClipUploadResp {
   uploadId: string;
   uploadUrl: string;
-  offset: 0;
+  offset: number; // 新建为 0；幂等创建返回当前确认偏移
   expiresAt: number;
 }
 ```
@@ -736,6 +752,7 @@ interface RequestCreateClipPayload {
   endServerMs: number;
   items: {
     itemId: string;
+    generation: number;
     trackId: string;
     uploadToken: string;
     uploadTokenExpiresAt: number;

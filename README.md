@@ -34,3 +34,10 @@ src/
 ### 后端开发
 
 服务端使用 bwcx，提供简洁的 OOP 开发体验，参考 [bwcx 文档](https://bwcxjs.github.io/bwcx/)。
+
+### ai coding
+本项目 AI Coding 采取 Spec Coding 的方案，基于 [spec-Kit](https://github.com/github/spec-kit)。
+
+如果你需要开发新的独立功能模块请使用 spec-kit 并进行开发（推荐使用 Codex CLI、Claude Code、CodeBuddy Code）。
+
+若只是修复 bug 等简单工作，vibe coding 即可。

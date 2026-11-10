@@ -18,6 +18,8 @@ import DefaultResponseHandler from '@server/response-handlers/default.response-h
 import RedisClient from './lib/redis-client';
 import SocketIOServer from './modules/socket-io/socket-io';
 import MediasoupWorker from './lib/mediasoup-worker';
+import TypeOrmClient from './database/typeorm-client';
+import ClipService from './modules/clip/clip.service';
 
 export default class OurApp extends App {
   protected baseDir = path.join(__dirname, '..');
@@ -25,6 +27,8 @@ export default class OurApp extends App {
   protected scanGlobs = [
     './server/**/*.(j|t)s',
     '!./server/**/*.d.ts',
+    // typeorm CLI 专用数据源，不参与应用扫描
+    '!./server/database/typeorm-cli-data-source.(j|t)s',
     './common/**/*.(j|t)s',
     '!./common/**/*.d.ts',
     '!./common/api/**',
@@ -80,6 +84,8 @@ export default class OurApp extends App {
     const mediasoupWorker = getDependency<MediasoupWorker>(MediasoupWorker, this.container);
     await mediasoupWorker.init();
     await mediasoupWorker.createRouter('default');
+    const typeOrmClient = getDependency<TypeOrmClient>(TypeOrmClient, this.container);
+    await typeOrmClient.init();
   }
 
   protected async afterStart() {
@@ -91,6 +97,10 @@ export default class OurApp extends App {
     await redisClient.close();
     const mediasoupWorker = getDependency<MediasoupWorker>(MediasoupWorker, this.container);
     mediasoupWorker.close();
+    const clipService = getDependency<ClipService>(ClipService, this.container);
+    await clipService.stop();
+    const typeOrmClient = getDependency<TypeOrmClient>(TypeOrmClient, this.container);
+    await typeOrmClient.destroy();
     console.log('Cleaned up before exit');
   }
 }
@@ -110,6 +120,12 @@ app
         });
       });
       await listenPromise;
+      // 精彩回放依赖 Socket.io 下发与推送；启动失败（如未执行 migration）不影响其他功能
+      try {
+        await getDependency<ClipService>(ClipService, app.container).start();
+      } catch (e) {
+        console.error('Failed to start highlight replay, did you run `pnpm run db:migration:run`?', e);
+      }
     });
   })
   .catch((err) => {

@@ -1,9 +1,11 @@
 /* eslint-disable @typescript-eslint/no-invalid-this */
 
-import { Controller } from 'bwcx-ljsm';
+import { Controller, createReqParamDecorator } from 'bwcx-ljsm';
 import type { ControllerOptions } from 'bwcx-ljsm';
 import { getIdentifierFromDecorated, getDependency } from 'bwcx-core';
 import type { DependencyIdentifier } from 'bwcx-core';
+import { ErrCode } from '@common/enums/err-code.enum';
+import LogicException from '@server/exceptions/logic.exception';
 
 /**
  * API 控制器，路由会以 `/api` 为前缀
@@ -60,4 +62,19 @@ export function LazyInject(id?: DependencyIdentifier) {
     const identifier = getIdentifierFromDecorated(target, propertyKey, parameterIndex, id);
     _lazyInjectProxyGetter(target, propertyKey, identifier, true);
   };
+}
+
+/**
+ * 从 `X-UCA` 请求头取比赛 alias，缺失时抛出非法参数
+ *
+ * @decorator {parameter}
+ */
+export function Uca() {
+  return createReqParamDecorator((ctx) => {
+    const uca = ctx.headers['x-uca'];
+    if (typeof uca !== 'string' || !uca) {
+      throw new LogicException(ErrCode.IllegalParameters);
+    }
+    return uca;
+  });
 }

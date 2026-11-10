@@ -19,3 +19,5 @@ services:
       - PUBLIC_IP=your-public-ip
     volumes:
       - /your-logs-path/rankland-broadcast-hub:/root/.pm2/logs
+      # 精彩回放的 SQLite 数据库与媒体文件，必须持久化
+      - /your-data-path/rankland-broadcast-hub:/app/data

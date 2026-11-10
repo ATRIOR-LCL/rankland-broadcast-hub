@@ -19,6 +19,17 @@ import type {
   RtpParameters,
   WebRtcTransport,
 } from 'mediasoup/node/lib/types';
+import type {
+  ClipCategory,
+  RequestCreateClipAck,
+  RequestCreateClipPayload,
+  SubscribeClipsReq,
+} from '@common/modules/clip/clip.dto';
+
+export type RequestCreateClipResult =
+  | { kind: 'offline' }
+  | { kind: 'timeout' }
+  | { kind: 'ack'; ack: RequestCreateClipAck };
 
 interface BroadcasterMediaRoom {
   peers: Map<string, MediaRoomPeer>;
@@ -66,6 +77,7 @@ export default class SocketIOServer {
   public broadcasterNsp: Namespace<DefaultEventsMap, DefaultEventsMap, DefaultEventsMap, any>;
   // public viewerNsp: Namespace<DefaultEventsMap, DefaultEventsMap, DefaultEventsMap, any>;
   public shotNsp: Namespace<DefaultEventsMap, DefaultEventsMap, DefaultEventsMap, any>;
+  public clipsNsp: Namespace<DefaultEventsMap, DefaultEventsMap, DefaultEventsMap, any>;
 
   public init(server: http.Server) {
     this.io = new Server(server, {
@@ -78,6 +90,7 @@ export default class SocketIOServer {
     this.rootMount();
     this.broadcasterMount();
     this.shotMount();
+    this.clipsMount();
   }
 
   public rootMount() {
@@ -137,6 +150,8 @@ export default class SocketIOServer {
       console.log(`[socket] [/broadcaster] [connection] [${uca}:${userId}]`, id, role);
       if (role === 'broadcaster') {
         // TODO 踢出其他 broadcaster
+        // 精彩回放下发目标
+        socket.data.clipBroadcasterKey = this.getClipBroadcasterKey(uca, userId);
       }
       if (role === 'director') {
         socket.join(this.getViewerLogicRoomKey(uca, userId));
@@ -948,6 +963,114 @@ export default class SocketIOServer {
         );
       });
     });
+  }
+
+  public clipsMount() {
+    this.clipsNsp = this.io.of('/clips');
+    this.clipsNsp.use(async (socket, next) => {
+      const uca = socket.handshake.headers['x-uca']?.toString() || socket.handshake.query.uca?.toString() || '';
+      if (!uca) {
+        console.log('[socket] [/clips] [authGuard] all fields are missing');
+        return next(getGuardErrorObject(new LogicException(ErrCode.IllegalParameters)));
+      }
+      const { directorToken } = socket.handshake.auth;
+      // TODO use contest-specific token instead of global auth token
+      if (!directorToken || directorToken !== process.env.AUTH_TOKEN) {
+        console.log('[socket] [/clips] [authGuard] invalid director token');
+        return next(getGuardErrorObject(new LogicException(ErrCode.InvalidAuthInfo)));
+      }
+      next();
+    });
+
+    this.clipsNsp.on('connection', (socket) => {
+      const uca = socket.handshake.headers['x-uca']?.toString() || socket.handshake.query.uca?.toString() || '';
+      console.log(`[socket] [/clips] [connection] [${uca}]`, socket.id);
+      socket.join(this.getClipsLogicRoomKey(uca));
+
+      /**
+       * subscribeClips: 订阅切片事件，新订阅替换旧订阅；categories/userIds 省略表示不过滤
+       * @role director
+       */
+      registerSocketEvent(socket, 'subscribeClips', async (data: SubscribeClipsReq = {}) => {
+        if (
+          (data.categories !== undefined && !Array.isArray(data.categories)) ||
+          (data.userIds !== undefined && !Array.isArray(data.userIds))
+        ) {
+          throw new LogicException(ErrCode.IllegalParameters);
+        }
+        socket.data.clipFilter = {
+          categories: data.categories,
+          userIds: data.userIds,
+        };
+        return {
+          subscribed: true,
+          serverTimestamp: Date.now(),
+        };
+      });
+    });
+  }
+
+  /**
+   * 向比赛内指定选手最近建立的连接下发切片请求并等待 ACK
+   */
+  public requestCreateClip(
+    uca: string,
+    userId: string,
+    payload: RequestCreateClipPayload,
+    timeoutMs: number,
+  ): Promise<RequestCreateClipResult> {
+    const key = this.getClipBroadcasterKey(uca, userId);
+    let target: Socket | undefined;
+    this.broadcasterNsp.sockets.forEach((socket) => {
+      if (socket.data.clipBroadcasterKey === key) {
+        target = socket;
+      }
+    });
+    if (!target) {
+      return Promise.resolve({ kind: 'offline' });
+    }
+    console.log(`[socket] [/broadcaster] [emit.requestCreateClip] [${uca}:${userId}] task:`, payload.taskId);
+    return new Promise((resolve) => {
+      target.timeout(timeoutMs).emit('requestCreateClip', payload, (err: Error | null, ack: RequestCreateClipAck) => {
+        if (err) {
+          resolve({ kind: 'timeout' });
+          return;
+        }
+        resolve({
+          kind: 'ack',
+          ack: { accepted: !!ack?.accepted, errorCode: ack?.errorCode, errorMessage: ack?.errorMessage },
+        });
+      });
+    });
+  }
+
+  /**
+   * 向订阅了该比赛、且分类/选手匹配的导播推送切片事件
+   */
+  public emitClipEvent(uca: string, category: ClipCategory, userId: string, event: string, data: any) {
+    this.clipsNsp
+      ?.in(this.getClipsLogicRoomKey(uca))
+      .fetchSockets()
+      .then((sockets) => {
+        sockets.forEach((socket) => {
+          const filter = socket.data.clipFilter;
+          if (
+            filter &&
+            (!filter.categories || filter.categories.includes(category)) &&
+            (!filter.userIds || filter.userIds.includes(userId))
+          ) {
+            socket.emit(event, data);
+          }
+        });
+      });
+  }
+
+  private getClipBroadcasterKey(uca: string, userId: string) {
+    return `${uca}:${userId}`;
+  }
+
+  private getClipsLogicRoomKey(uca: string) {
+    return `clips:${uca}`;
   }
 
   private getBroadcasterLogicRoomKey(uca: string, userId: string) {

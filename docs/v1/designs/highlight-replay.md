@@ -4,9 +4,22 @@
 
 本阶段只定义设计、数据模型、协议边界和验收标准，不实现代码。
 
+## 首版实现说明（2026-11-02）
+
+本版只实现手动精彩回放，自动化配置、命中记录、agent 接口与触发器延后，下文自动化章节仅作未来参考。
+Hub 已按 [功能规格](../../../specs/001-highlight-replay/spec.md)、[技术计划](../../../specs/001-highlight-replay/plan.md)
+和 [契约补充](../../../specs/001-highlight-replay/contracts/highlight-replay.md) 实现，并通过协议测试端验收；
+真实 KtB/KtO 联调尚未进行。
+
+- 导播鉴权沿用现有 `X-Token` / `directorToken`；选手上传使用下发时生成的短期 upload token。
+- 只接受已结束的时间窗；全部任务项成功为 `ready`，部分成功为 `partial_ready`。
+- 任务项每轮重试使用新的 generation 和 token，旧 token 失效，成功项不重派发。
+- 上传写入并落盘后才确认 offset；校验通过并入库后才通知 `clipCreated`。
+- 元数据使用 SQLite（TypeORM 实体 + migration），媒体使用本地文件系统，单实例运行。
+
 ## 目标
 
-- Hub 负责持久化管理自动化任务、具体切片任务、上传会话和最终切片元数据。
+- Hub 本版持久化管理手动切片任务、上传会话和最终切片元数据。
 - KtB 在比赛期间持续本地录制各 track 的分段媒体文件，并按 Hub 的切片请求从本地分段中拼接出片段。
 - KtB 使用 HTTP 断点续传把已编码媒体文件上传到 Hub。
 - KtO 通过 Hub 列出切片、接收切片创建通知，并使用 HTTP Range 流式读取媒体。
@@ -23,7 +36,7 @@
 
 ### Hub 服务端
 
-- 保存 `ClipAutomationTask`，即“当某类条件满足时应如何创建切片任务”的配置。
+- 自动化配置保存延后，不是本版 Hub 职责。
 - 保存 `ClipTask` 长任务，维护状态、进度、错误、重试次数和来源。
 - 通过 Socket.io 向指定 KtB 下发 `requestCreateClip` 请求。
 - 提供断点上传 HTTP 接口，接收 KtB 上传的媒体文件。
@@ -45,7 +58,7 @@
 - 订阅 Hub 的切片任务和切片创建事件。
 - 自行决定如何在导播 UI、OBS 源或直播编排中消费切片。
 
-### 自动化 agent
+### 自动化 agent（后续版本）
 
 自动化 agent 是未来归属于 Hub 服务端的独立脚本或子进程，本计划只定义它的存储和接口边界：
 
@@ -72,10 +85,8 @@ sequenceDiagram
   participant KtO as KtO 导播端
   participant Hub as Hub 服务端
   participant KtB as KtB 选手端
-  participant Agent as Hub 自动化 agent
 
   KtO->>Hub: 创建手动 ClipTask
-  Agent->>Hub: 命中 ClipAutomationTask 后创建 ClipTask
   Hub->>KtB: requestCreateClip(taskId, track, time window)
   KtB->>Hub: progress(client_processing)
   KtB->>Hub: 创建 ClipUpload
@@ -111,7 +122,7 @@ interface LocalRecordingSegment {
 
 如果 KtB 无法可靠覆盖请求时间窗，应返回 `recording_range_missing`，由 Hub 将对应任务项标记为不可重试失败。
 
-## 自动化任务模型
+## 自动化任务模型（后续版本）
 
 自动化任务是 Hub 的持久化配置，不代表正在执行的后台进程。它描述“将来 agent 命中条件后应创建怎样的 `ClipTask`”。
 
@@ -160,7 +171,7 @@ interface ClipAutomationTask {
 - `client_processing`：KtB 正在本地定位、拼接、提取元数据。
 - `uploading`：KtB 正在上传媒体或缩略图。
 - `verifying`：Hub 正在校验文件和元数据。
-- `ready`：至少一个任务项已生成可播放 `Clip`，且没有未完成项。
+- `ready`：全部任务项已生成可播放 `Clip`，且没有未完成项。
 - `partial_ready`：部分任务项成功，部分任务项失败。
 - `failed`：任务整体失败。
 - `cancelled`：任务被管理端取消。
@@ -202,10 +213,8 @@ interface ClipTaskProgress {
 
 ### SQLite 表
 
-首版建议 SQLite 表如下：
+本版 SQLite 表如下（自动化两表延后）：
 
-- `clip_automation_tasks`：自动化任务配置。
-- `clip_automation_runs`：自动化任务命中记录。
 - `clip_tasks`：具体切片长任务。
 - `clip_task_items`：任务中的 track 级请求项。
 - `clip_uploads`：断点上传会话。
@@ -327,8 +336,6 @@ CLIP_TASK_MAX_ATTEMPTS=3
 ## 验收标准
 
 - 手动创建单 track `ClipTask` 后，KtB 能收到 `requestCreateClip` 并上传，Hub 生成 `ready` 切片。
-- 创建“FB 自动化任务”配置后，Hub 能完整保存 trigger、目标选择、时间窗、分类、启用状态。
-- 未来 agent 可读取自动化任务并通过统一任务创建接口生成 `ClipTask`，同时写入 `ClipAutomationRun`。
 - KtB 离线、track 不存在、录制范围缺失时，Hub 能给出明确失败状态和错误码。
 - 上传中断后，KtB 能通过 `HEAD` 获取 offset 并继续上传。
 - Hub 校验失败时，不生成 `ready` 切片。
