@@ -439,6 +439,17 @@ export default class ClipRepository {
     return row ? this.mapTaskItem(row) : null;
   }
 
+  /** 已下发但凭证租约过期的任务（选手端掉线或卡住，不再续租） */
+  public listLeaseExpiredTaskIds(now: number): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT task_id FROM clip_task_items
+        WHERE status IN ('requested', 'client_processing', 'uploading') AND upload_token_expires_at <= @now`,
+      )
+      .all({ now }) as { task_id: string }[];
+    return rows.map((row) => row.task_id);
+  }
+
   public updateTaskItem(
     itemId: string,
     patch: Partial<ClipTaskItem> & { uploadTokenHash?: string; uploadTokenExpiresAt?: number },
@@ -499,6 +510,7 @@ export default class ClipRepository {
       offset: 'offset',
       status: 'status',
       storagePath: 'storage_path',
+      expiresAt: 'expires_at',
     };
     Object.keys(scalarMap).forEach((key) => {
       const value = (patch as any)[key];

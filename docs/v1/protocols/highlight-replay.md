@@ -414,6 +414,7 @@ interface CreateClipTaskReq {
 约束：
 
 - `endServerMs` 必须大于 `startServerMs`。
+- `startServerMs` 不能晚于 Hub 当前时间；`endServerMs` 可以在未来（例如自动化的 postRoll），KtB 会等录像覆盖终点后再截取。
 - `trackIds` 至少包含一个 track。
 - `source = 'automation'` 时，建议携带 `automationId` 和 `automationRunId`。
 - `idempotencyKey` 在同一 `uca` 内幂等；重复请求返回已创建任务。
@@ -470,6 +471,8 @@ interface GetClipTaskResp {
 ### POST /api/clips/tasks/:taskId/progress
 
 KtB 报告任务或任务项进度。
+
+请求头：导播/agent 使用 `X-Token`；KtB 使用 `X-Upload-Token`，此时必须携带 `itemId`，且只能上报该 token 对应的任务项。
 
 请求：
 
@@ -577,6 +580,12 @@ HTTP/1.1 409 Conflict
 Upload-Offset: 2097152
 ```
 
+补充约定：
+
+- 每次 PATCH 成功后，上传会话有效期顺延 `CLIP_UPLOAD_TOKEN_TTL_MS`。
+- `Upload-Offset + Content-Length` 超过 `uploadLength` 时直接拒绝，不读取请求体。
+- 分块传输中断时，本次分块整体作废，offset 保持在上一次成功的位置；请求体超过 `CLIP_UPLOAD_IDLE_TIMEOUT_MS`（默认 20s）没有新数据时同样作废，以释放该上传的写锁。客户端应先 HEAD 获取 offset，再续传。
+
 ### POST /api/clips/uploads/:uploadId/complete
 
 完成上传并提交媒体元数据。
@@ -620,7 +629,7 @@ interface CompleteClipUploadResp {
 }
 ```
 
-Hub 完成校验后才返回 `clip`。如果校验进入异步队列，可先返回更新后的 `task`，随后通过 Socket.io 推送 `clipTaskUpdated` 和 `clipCreated`。
+Hub 校验 `durationMs` 与 `actualEndServerMs - actualStartServerMs` 一致，并在 WebM 文件写有 Duration 时与文件时长对照，误差超过 1s 拒绝。Hub 完成校验后才返回 `clip`。如果校验进入异步队列，可先返回更新后的 `task`，随后通过 Socket.io 推送 `clipTaskUpdated` 和 `clipCreated`。
 
 ## 切片消费 API
 
@@ -758,6 +767,13 @@ interface RequestCreateClipAck {
 ```
 
 如果 KtB 返回 `accepted: false`，Hub 应将任务置为可重试或失败，具体取决于 `errorCode`。
+
+Hub 的处理约定：
+
+- `accepted: true` 后，已下发的任务项进入 `client_processing`。
+- ack 超时或可重试的拒绝：任务回到 `queued`，按 `attempts × CLIP_REQUEST_ACK_TIMEOUT_MS` 退避后重新下发，超过 `maxAttempts` 置为 `failed`。
+- 选手端离线时任务保持 `queued`，不计入尝试次数，等其 `confirmReady` 后再下发。
+- `uploadToken` 同时是任务项的租约：KtB 上报进度、上传分块成功时续期 `CLIP_UPLOAD_TOKEN_TTL_MS`。租约过期仍未完成的任务项（KtB 掉线、重启或卡住）由 Hub 定期回收，任务回到 `queued` 并以新的 token 重新下发（错误码 `client_lost`）。
 
 ### /clips 命名空间
 

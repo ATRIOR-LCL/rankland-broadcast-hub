@@ -407,6 +407,57 @@ describe('ClipService', () => {
     expect(repository.getTaskItem(task.items[0].itemId)?.status).toBe('cancelled');
   });
 
+  it('moves requested items to client_processing when the broadcaster accepts', async () => {
+    const task = await createAliceTask(service);
+    await service.beginTaskDispatch(task.taskId);
+
+    const accepted = await service.markTaskAccepted(task.taskId);
+
+    expect(accepted.status).toBe('client_processing');
+    expect(accepted.items[0].status).toBe('client_processing');
+  });
+
+  it('requeues dispatched tasks whose lease expired and renews the lease on progress', async () => {
+    const task = await createAliceTask(service);
+    const dispatch = await service.beginTaskDispatch(task.taskId);
+    const itemId = task.items[0].itemId;
+    repository.updateTaskItem(itemId, { uploadTokenExpiresAt: Date.now() - 1 });
+    const queued: string[] = [];
+    service.on('clipTaskQueued', (queuedTask) => queued.push(queuedTask.taskId));
+
+    await expect(
+      service.reportProgress('contest-a', task.taskId, { itemId, status: 'client_processing', progress: 10 }, dispatch.items[0].uploadToken),
+    ).rejects.toMatchObject<Partial<LogicException>>({ code: ErrCode.ClipUploadExpired });
+    await service.requeueLeaseExpiredTasks();
+
+    expect((await service.getTask(task.taskId)).status).toBe('queued');
+    expect(queued).toEqual([task.taskId]);
+
+    const retry = await service.beginTaskDispatch(task.taskId);
+    repository.updateTaskItem(itemId, { uploadTokenExpiresAt: Date.now() + 10 });
+    await service.reportProgress('contest-a', task.taskId, { itemId, status: 'client_processing', progress: 10 }, retry.items[0].uploadToken);
+    expect(repository.getTaskItem(itemId)!.uploadTokenExpiresAt).toBeGreaterThan(Date.now() + 60000);
+    await service.requeueLeaseExpiredTasks();
+    expect((await service.getTask(task.taskId)).status).toBe('client_processing');
+  });
+
+  it('rejects windows starting in the future but allows a future end', async () => {
+    await expect(createAliceTask(service, Date.now() + 10000, Date.now() + 20000)).rejects.toMatchObject<Partial<LogicException>>({
+      code: ErrCode.ClipTaskInvalidTimeWindow,
+    });
+    await expect(createAliceTask(service, Date.now() - 5000, Date.now() + 5000)).resolves.toBeTruthy();
+  });
+
+  it('rejects metadata whose duration disagrees with its time window', async () => {
+    const { uploadToken, upload } = await createUploadedMedia(service);
+
+    await expect(
+      service.completeUpload('contest-a', uploadToken, upload.uploadId, {
+        metadata: { actualStartServerMs: 1000, actualEndServerMs: 9000, durationMs: 60000, container: 'mp4' },
+      }),
+    ).rejects.toMatchObject<Partial<LogicException>>({ code: ErrCode.ClipMediaValidationFailed });
+  });
+
   it('requires uca when reading clips', async () => {
     const clip = await createReadyClip(service);
 
@@ -470,6 +521,18 @@ describe('ClipService', () => {
     expect(deleted.clips[0].clipId).toBe(clip.clipId);
   });
 });
+
+function createAliceTask(service: ClipService, startServerMs = 1000, endServerMs = 9000) {
+  return service.createTask('contest-a', {
+    source: 'manual',
+    userId: 'alice',
+    trackIds: ['screen'],
+    startServerMs,
+    endServerMs,
+    title: 'Manual clip',
+    category: 'manual',
+  });
+}
 
 async function createReadyClip(service: ClipService) {
   const task = await service.createTask('contest-a', {

@@ -584,6 +584,12 @@ export default class SocketIOServer {
       }
     });
 
+    setInterval(() => {
+      this.clipService.requeueLeaseExpiredTasks().catch((error) => {
+        console.error('[socket] [/clips] requeue lease expired tasks failed', error);
+      });
+    }, Math.min(this.clipConfig.uploadTokenTtlMs / 2, 30000)).unref();
+
     this.clipService.on('clipTaskQueued', (task) => {
       this.dispatchClipTask(task).catch((error) => {
         console.error(`[socket] [/clips] dispatch queued task failed: ${task.taskId}`, error);
@@ -1100,6 +1106,10 @@ export default class SocketIOServer {
     }
     this.clipDispatchingTaskIds.add(task.taskId);
     try {
+      // 重试定时器、confirmReady 可能同时触发，只下发仍在排队的任务
+      if ((await this.clipService.getTask(task.taskId)).status !== 'queued') {
+        return;
+      }
       const roomKey = this.getBroadcasterLogicRoomKey(task.uca, task.userId);
       const sockets = await this.broadcasterNsp.in(roomKey).allSockets();
       if (sockets.size === 0) {
@@ -1118,28 +1128,44 @@ export default class SocketIOServer {
         payload,
         async (err: Error | null, responses: RequestCreateClipAck[]) => {
           if (err || !responses || responses.length === 0) {
-            await this.clipService.markTaskDispatchFailed(
+            const updated = await this.clipService.markTaskDispatchFailed(
               task.taskId,
               'socket_timeout',
               err?.message || 'requestCreateClip ack timeout',
               true,
             );
+            this.scheduleClipTaskRetry(updated);
             return;
           }
           const ack = responses[0];
           if (!ack.accepted) {
-            await this.clipService.markTaskDispatchFailed(
+            const updated = await this.clipService.markTaskDispatchFailed(
               task.taskId,
               ack.errorCode || 'client_rejected',
               ack.errorMessage,
               isRetryableClipDispatchError(ack.errorCode),
             );
+            this.scheduleClipTaskRetry(updated);
+            return;
           }
+          await this.clipService.markTaskAccepted(task.taskId);
         },
       );
     } finally {
       this.clipDispatchingTaskIds.delete(task.taskId);
     }
+  }
+
+  /** 下发失败后按已尝试次数退避重发；选手端离线的任务保持 queued，等其 confirmReady 时再下发 */
+  private scheduleClipTaskRetry(task: ClipTask) {
+    if (task.status !== 'queued') {
+      return;
+    }
+    setTimeout(() => {
+      this.dispatchClipTask(task).catch((error) => {
+        console.error(`[socket] [/clips] retry dispatch failed: ${task.taskId}`, error);
+      });
+    }, task.attempts * this.clipConfig.requestAckTimeoutMs);
   }
 
   private async emitClipCreated(clip: Clip) {
