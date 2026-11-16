@@ -32,6 +32,7 @@ import {
 } from '@common/modules/clips';
 import { ErrCode } from '@common/enums/err-code.enum';
 import { ApiController } from '@server/decorators';
+import { CustomResponse } from '@server/response-handlers/custom.response-handler';
 import AuthGuard from '@server/guards/auth.guard';
 import LogicException from '@server/exceptions/logic.exception';
 import ClipService from './clip.service';
@@ -127,12 +128,16 @@ export default class ClipController {
     return { task: await this.service.getTask(data.taskId) };
   }
 
+  /** 导播/agent 使用 X-Token，KtB 使用 X-Upload-Token */
   @Post('/tasks/:taskId/progress')
-  @UseGuards(AuthGuard)
   @Contract(ReportClipTaskProgressReqDTO, ClipTaskRespDTO)
   public async reportTaskProgress(@Data() data: ReportClipTaskProgressReqDTO) {
     const { taskId, ...req } = data;
-    return { task: await this.service.reportProgress(this.getUca(), taskId, req) };
+    const uploadToken = this.ctx.headers['x-upload-token']?.toString();
+    if (!uploadToken && !(await new AuthGuard().canPass(this.ctx))) {
+      throw new LogicException(ErrCode.Unauthorized);
+    }
+    return { task: await this.service.reportProgress(this.getUca(), taskId, req, uploadToken) };
   }
 
   @Post('/tasks/:taskId/uploads')
@@ -143,6 +148,7 @@ export default class ClipController {
   }
 
   @Head('/uploads/:uploadId')
+  @CustomResponse()
   public async headUpload(@Param('uploadId') uploadId: string) {
     const head = await this.service.getUploadHead(this.getUca(), this.getUploadToken(), uploadId);
     this.ctx.status = 204;
@@ -150,9 +156,14 @@ export default class ClipController {
   }
 
   @Patch('/uploads/:uploadId')
+  @CustomResponse()
   public async patchUpload(@Param('uploadId') uploadId: string) {
     const uploadOffset = parseIntegerHeader(this.ctx.headers['upload-offset']);
     const head = await this.service.getUploadHead(this.getUca(), this.getUploadToken(), uploadId);
+    const contentLength = this.ctx.headers['content-length'];
+    if (contentLength !== undefined && uploadOffset + parseIntegerHeader(contentLength) > head.uploadLength) {
+      throw new LogicException(ErrCode.IllegalParameters);
+    }
     if (uploadOffset !== head.offset) {
       this.ctx.status = 409;
       this.setUploadHeaders(head);
@@ -202,6 +213,7 @@ export default class ClipController {
   }
 
   @Get('/:clipId/thumbnail')
+  @CustomResponse()
   @UseGuards(AuthGuard)
   public async getThumbnail(@Param('clipId') clipId: string) {
     const { clip, path, size } = await this.service.getClipThumbnail(this.getUca(), clipId);
@@ -213,6 +225,7 @@ export default class ClipController {
   }
 
   @Head('/:clipId/media')
+  @CustomResponse()
   @UseGuards(AuthGuard)
   public async headMedia(@Param('clipId') clipId: string) {
     const { clip, size } = await this.service.getClipMedia(this.getUca(), clipId);
@@ -224,6 +237,7 @@ export default class ClipController {
   }
 
   @Get('/:clipId/media')
+  @CustomResponse()
   @UseGuards(AuthGuard)
   public async getMedia(@Param('clipId') clipId: string) {
     const { clip, path, size } = await this.service.getClipMedia(this.getUca(), clipId);

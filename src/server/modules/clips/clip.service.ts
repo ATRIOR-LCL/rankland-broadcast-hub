@@ -28,6 +28,10 @@ import ClipConfig from '@server/configs/clips/clip.config';
 import LogicException from '@server/exceptions/logic.exception';
 import LiveContestService from '@server/modules/live-contest/live-contest.service';
 import ClipRepository, { ClipUpload, StoredClip } from './clip.repository';
+import { readWebmDurationMs } from './webm.util';
+
+/** 声明时长与实际时长允许的误差 */
+const MEDIA_DURATION_TOLERANCE_MS = 1000;
 
 type ClipServiceEvent = 'clipTaskQueued' | 'clipTaskUpdated' | 'clipCreated' | 'clipDeleted';
 
@@ -243,10 +247,19 @@ export default class ClipService extends EventEmitter {
     return task;
   }
 
-  public async reportProgress(uca: string, taskId: string, req: ReportClipTaskProgressReq): Promise<ClipTask> {
+  /** uploadToken 为空表示导播/agent 调用（已通过 X-Token 鉴权）；否则为 KtB 调用，只能上报自己的任务项 */
+  public async reportProgress(
+    uca: string,
+    taskId: string,
+    req: ReportClipTaskProgressReq,
+    uploadToken?: string,
+  ): Promise<ClipTask> {
     const task = await this.getTask(taskId);
     if (task.uca !== uca) {
       throw new LogicException(ErrCode.ClipTaskNotFound);
+    }
+    if (uploadToken !== undefined && !req.itemId) {
+      throw new LogicException(ErrCode.IllegalParameters);
     }
     const now = Date.now();
     this.validateProgressStatus(req.status, Boolean(req.itemId));
@@ -255,11 +268,15 @@ export default class ClipService extends EventEmitter {
       if (!item) {
         throw new LogicException(ErrCode.ClipTaskNotFound);
       }
+      if (uploadToken !== undefined) {
+        this.verifyItemToken(this.repository.getTaskItem(req.itemId)!, uploadToken);
+      }
       this.repository.updateTaskItem(req.itemId, {
         status: req.status as ClipTaskItemStatus,
         progress: clampProgress(req.progress),
         errorCode: req.errorCode,
         errorMessage: req.errorMessage || req.message,
+        uploadTokenExpiresAt: uploadToken !== undefined ? now + this.config.uploadTokenTtlMs : undefined,
         updatedAt: now,
       });
       await this.recalculateTask(taskId);
@@ -326,6 +343,32 @@ export default class ClipService extends EventEmitter {
     };
   }
 
+  /** 选手端 ack 接受后，已下发的任务项进入 client_processing */
+  public async markTaskAccepted(taskId: string): Promise<ClipTask> {
+    const task = await this.getTask(taskId);
+    task.items
+      .filter((item) => item.status === 'requested')
+      .forEach((item) => {
+        this.repository.updateTaskItem(item.itemId, { status: 'client_processing', updatedAt: Date.now() });
+      });
+    const updated = await this.recalculateTask(taskId);
+    this.emit('clipTaskUpdated', updated);
+    return updated;
+  }
+
+  /**
+   * 下发后凭证租约过期仍未完成的任务（选手端掉线、重启或卡住）重新排队或置为失败。
+   * 租约在下发时签发，选手端上报进度、上传分块时续期。
+   */
+  public async requeueLeaseExpiredTasks(): Promise<void> {
+    for (const taskId of this.repository.listLeaseExpiredTaskIds(Date.now())) {
+      const updated = await this.markTaskDispatchFailed(taskId, 'client_lost', 'broadcaster stopped responding', true);
+      if (updated.status === 'queued') {
+        this.emit('clipTaskQueued', updated);
+      }
+    }
+  }
+
   public async markTaskDispatchFailed(
     taskId: string,
     errorCode: string,
@@ -352,9 +395,6 @@ export default class ClipService extends EventEmitter {
       updatedAt: Date.now(),
     })!;
     this.emit('clipTaskUpdated', updated);
-    if (!shouldFail) {
-      this.emit('clipTaskQueued', updated);
-    }
     return updated;
   }
 
@@ -452,8 +492,14 @@ export default class ClipService extends EventEmitter {
       fs.truncateSync(absPath, upload.offset);
       const output = fs.createWriteStream(absPath, { flags: 'r+', start: upload.offset });
       let received = 0;
+      // 客户端断网但 TCP 未断开时请求体会一直挂起并占住上传锁，空闲超时后放弃本次分块以便客户端续传
+      const idleTimer = setTimeout(
+        () => stream.destroy(new LogicException(ErrCode.IllegalParameters)),
+        this.config.uploadIdleTimeoutMs,
+      );
       try {
         for await (const chunk of stream) {
+          idleTimer.refresh();
           const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
           if (upload.offset + received + buffer.length > upload.uploadLength) {
             throw new LogicException(ErrCode.IllegalParameters);
@@ -469,13 +515,19 @@ export default class ClipService extends EventEmitter {
         output.destroy();
         fs.truncateSync(absPath, upload.offset);
         throw error;
+      } finally {
+        clearTimeout(idleTimer);
       }
       const nextOffset = upload.offset + received;
+      const now = Date.now();
+      // 会话有效期随上传进展顺延，限速上传或断网续传耗时较长时不会中途过期
       const updated = this.repository.updateUpload(uploadId, {
         offset: nextOffset,
         status: nextOffset > 0 ? 'uploading' : upload.status,
-        updatedAt: Date.now(),
+        expiresAt: now + this.config.uploadTokenTtlMs,
+        updatedAt: now,
       })!;
+      this.repository.updateTaskItem(upload.itemId, { uploadTokenExpiresAt: now + this.config.uploadTokenTtlMs, updatedAt: now });
       return { offset: updated.offset };
     });
   }
@@ -644,6 +696,10 @@ export default class ClipService extends EventEmitter {
     if (req.endServerMs - req.startServerMs > this.config.maxDurationMs) {
       throw new LogicException(ErrCode.ClipTaskInvalidTimeWindow);
     }
+    // 终点允许在未来（自动化的 postRoll，选手端会等录像覆盖终点再截取），起点必须已经发生
+    if (req.startServerMs > Date.now()) {
+      throw new LogicException(ErrCode.ClipTaskInvalidTimeWindow);
+    }
     const tracks = await this.liveContestService.getBroadcasterStoreTracks(uca, req.userId);
     if (!tracks) {
       throw new LogicException(ErrCode.ClipTaskTargetOffline);
@@ -772,6 +828,10 @@ export default class ClipService extends EventEmitter {
     if ((upload.mimeType === 'video/mp4' && metadata.container !== 'mp4') || (upload.mimeType === 'video/webm' && metadata.container !== 'webm')) {
       throw new LogicException(ErrCode.ClipMediaValidationFailed);
     }
+    const windowMs = metadata.actualEndServerMs - metadata.actualStartServerMs;
+    if (Math.abs(windowMs - metadata.durationMs) > MEDIA_DURATION_TOLERANCE_MS) {
+      throw new LogicException(ErrCode.ClipMediaValidationFailed);
+    }
     const fd = fs.openSync(this.getAbsolutePath(upload.storagePath), 'r');
     try {
       const header = Buffer.alloc(16);
@@ -780,6 +840,11 @@ export default class ClipService extends EventEmitter {
         throw new LogicException(ErrCode.ClipMediaValidationFailed);
       }
       if (metadata.container === 'webm' && !header.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]))) {
+        throw new LogicException(ErrCode.ClipMediaValidationFailed);
+      }
+      // 文件内可读到时长时与声明对照；读不到（如 MediaRecorder 直出未写 Duration）时跳过
+      const fileDurationMs = metadata.container === 'webm' ? readWebmDurationMs(fd) : undefined;
+      if (fileDurationMs !== undefined && Math.abs(fileDurationMs - metadata.durationMs) > MEDIA_DURATION_TOLERANCE_MS) {
         throw new LogicException(ErrCode.ClipMediaValidationFailed);
       }
     } finally {
