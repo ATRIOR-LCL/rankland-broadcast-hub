@@ -717,7 +717,11 @@ Accept-Ranges: bytes
 
 ### DELETE /api/clips/:clipId
 
-删除或标记过期切片。首版建议软删除，实际文件由清理任务异步删除。
+删除切片。记录保留为 `deleted`（可用 `GET /api/clips?status=deleted` 查到），媒体与缩略图文件立即删除，不再占用 `CLIP_MAX_STORAGE_BYTES` 配额。
+
+Hub 每 10 分钟清理一次过期数据：
+- 超过保留期限（`expiresAt`，默认创建任务后 `CLIP_DEFAULT_RETENTION_DAYS` 天）的切片置为 `expired` 并删除文件，同时推送 `clipDeleted`（`status: 'expired'`）。
+- 上传会话过期仍未 complete 的上传（被放弃的媒体、未被关联的缩略图）删除已上传的数据，状态置为 `expired`。
 
 响应：
 

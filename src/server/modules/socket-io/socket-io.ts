@@ -590,6 +590,12 @@ export default class SocketIOServer {
       });
     }, Math.min(this.clipConfig.uploadTokenTtlMs / 2, 30000)).unref();
 
+    setInterval(() => {
+      this.clipService.purgeExpiredStorage().catch((error) => {
+        console.error('[socket] [/clips] purge expired clips and uploads failed', error);
+      });
+    }, 10 * 60 * 1000).unref();
+
     this.clipService.on('clipTaskQueued', (task) => {
       this.dispatchClipTask(task).catch((error) => {
         console.error(`[socket] [/clips] dispatch queued task failed: ${task.taskId}`, error);
