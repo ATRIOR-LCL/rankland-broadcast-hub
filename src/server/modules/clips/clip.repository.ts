@@ -40,7 +40,7 @@ export type StoredClip = Clip & {
   thumbnailPath?: string;
 };
 
-export type ListResult<T> = {
+export interface ListResult<T> {
   total: number;
   page: number;
   pageSize: number;
@@ -622,6 +622,25 @@ export default class ClipRepository {
       status,
     });
     return this.getClip(uca, clipId);
+  }
+
+  /** 超过保留期限仍为 ready 的切片 */
+  public listExpiredClips(now: number): StoredClip[] {
+    return this.db
+      .prepare(`SELECT * FROM clips WHERE status = 'ready' AND expires_at <= @now`)
+      .all({ now })
+      .map((row) => this.mapClip(row));
+  }
+
+  /** 租约已过期、文件仍是 .part（未被 complete 移入切片目录）的上传，即被放弃的上传与未被关联的缩略图 */
+  public listExpiredUploadIds(now: number): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT upload_id FROM clip_uploads
+        WHERE status != 'expired' AND expires_at <= @now AND storage_path LIKE '%.part'`,
+      )
+      .all({ now }) as { upload_id: string }[];
+    return rows.map((row) => row.upload_id);
   }
 
   private insertTaskItem(item: ClipTaskItem): void {

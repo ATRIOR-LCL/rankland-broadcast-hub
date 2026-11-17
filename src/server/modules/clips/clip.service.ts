@@ -674,8 +674,34 @@ export default class ClipService extends EventEmitter {
     if (!clip) {
       throw new LogicException(ErrCode.ClipNotFound);
     }
+    // 记录保留为 deleted 供列表查询，媒体与缩略图文件删除以释放存储配额
+    this.removeClipFiles(clip);
     this.emit('clipDeleted', { uca, clipId, status: 'deleted' });
     return { clipId, status: 'deleted' };
+  }
+
+  /** 定期清理：过了保留期限的切片置为 expired 并删除文件；租约过期仍未完成的上传删除 .part 文件 */
+  public async purgeExpiredStorage(now = Date.now()): Promise<void> {
+    for (const clip of this.repository.listExpiredClips(now)) {
+      this.repository.updateClipStatus(clip.uca, clip.clipId, 'expired');
+      this.removeClipFiles(clip);
+      this.emit('clipDeleted', { uca: clip.uca, clipId: clip.clipId, status: 'expired' });
+    }
+    for (const uploadId of this.repository.listExpiredUploadIds(now)) {
+      // 与 PATCH / complete 互斥，并在锁内再确认一次，避免清掉刚续期的上传
+      await this.withUploadLock(uploadId, async () => {
+        const upload = this.repository.getUpload(uploadId);
+        if (!upload || upload.status === 'expired' || upload.expiresAt > now || !upload.storagePath.endsWith('.part')) {
+          return;
+        }
+        fs.rmSync(this.getAbsolutePath(upload.storagePath), { force: true });
+        this.repository.updateUpload(uploadId, { status: 'expired', updatedAt: Date.now() });
+      });
+    }
+  }
+
+  private removeClipFiles(clip: StoredClip): void {
+    fs.rmSync(this.getAbsolutePath(path.dirname(clip.mediaPath)), { recursive: true, force: true });
   }
 
   public async findDispatchableTasks(uca: string, userId: string): Promise<ClipTask[]> {

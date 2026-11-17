@@ -520,6 +520,44 @@ describe('ClipService', () => {
     expect(deleted.total).toBe(1);
     expect(deleted.clips[0].clipId).toBe(clip.clipId);
   });
+
+  it('removes clip files on delete so they no longer count toward the storage quota', async () => {
+    const clip = await createReadyClip(service);
+    const clipDir = path.join(tempDir, 'contest-a', 'clips', clip.clipId);
+    expect(fs.readdirSync(clipDir).length).toBeGreaterThan(0);
+
+    await service.deleteClip('contest-a', clip.clipId);
+
+    expect(fs.existsSync(clipDir)).toBe(false);
+  });
+
+  it('purges abandoned upload files once the upload lease expires', async () => {
+    const { upload } = await createUploadedMedia(service);
+    const partPath = path.join(tempDir, 'contest-a', 'uploads', `${upload.uploadId}.part`);
+
+    await service.purgeExpiredStorage(Date.now());
+    expect(fs.existsSync(partPath)).toBe(true);
+
+    await service.purgeExpiredStorage(Date.now() + 900000 + 1);
+    expect(fs.existsSync(partPath)).toBe(false);
+    expect(repository.getUpload(upload.uploadId)?.status).toBe('expired');
+  });
+
+  it('expires clips past retention and removes their files', async () => {
+    const clip = await createReadyClip(service);
+    const clipDir = path.join(tempDir, 'contest-a', 'clips', clip.clipId);
+    const events: unknown[] = [];
+    service.on('clipDeleted', (event) => events.push(event));
+
+    await service.purgeExpiredStorage(Date.now());
+    expect(fs.existsSync(clipDir)).toBe(true);
+
+    await service.purgeExpiredStorage(Date.now() + 31 * 24 * 60 * 60 * 1000);
+    expect(fs.existsSync(clipDir)).toBe(false);
+    expect((await service.listClips({ uca: 'contest-a' })).total).toBe(0);
+    expect((await service.listClips({ uca: 'contest-a', status: 'expired' })).total).toBe(1);
+    expect(events).toEqual([{ uca: 'contest-a', clipId: clip.clipId, status: 'expired' }]);
+  });
 });
 
 function createAliceTask(service: ClipService, startServerMs = 1000, endServerMs = 9000) {
